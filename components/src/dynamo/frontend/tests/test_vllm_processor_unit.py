@@ -22,10 +22,14 @@ from _tool_guidance_parity import (
     tool_choice_value,
 )
 from transformers import AutoTokenizer
-from vllm.sampling_params import StructuredOutputsParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 from dynamo.frontend import prepost as prepost_module
-from dynamo.frontend.prepost import _prepare_request, build_tool_call_guided_decoding
+from dynamo.frontend.prepost import (
+    StreamingPostProcessor,
+    _prepare_request,
+    build_tool_call_guided_decoding,
+)
 from dynamo.llm.exceptions import InvalidArgument
 
 # NOTE: dynamo.frontend.vllm_processor is imported lazily inside the tests that
@@ -92,6 +96,142 @@ TOOL_REQUEST = {
         }
     ],
 }
+
+
+class TestDynamoJsonToolCallFallback:
+    """Dynamo's forced-choice JSON fallback must emit OpenAI tool calls."""
+
+    def _post_processor(
+        self, tokenizer, *, tool_choice, stream_response, parallel_tool_calls=None
+    ):
+        request = {**TOOL_REQUEST, "tool_choice": tool_choice}
+        if parallel_tool_calls is not None:
+            request["parallel_tool_calls"] = parallel_tool_calls
+        request, _, _, _, _ = _prepare_request(
+            request,
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+        return StreamingPostProcessor(
+            tokenizer=tokenizer,
+            request_for_sampling=request,
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[],
+            tool_parser=None,
+            reasoning_parser_class=None,
+            chat_template_kwargs={},
+            stream_response=stream_response,
+            uses_dynamo_json_tool_call_fallback=True,
+        )
+
+    def test_streaming_required_choice_converts_json_to_tool_calls(self, tokenizer):
+        post = self._post_processor(
+            tokenizer, tool_choice="required", stream_response=True
+        )
+
+        assert (
+            post.process_output(
+                SimpleNamespace(
+                    index=0,
+                    text='[{"name":"get_weather","parameters":',
+                    token_ids=[],
+                    finish_reason=None,
+                    logprobs=None,
+                )
+            )
+            is None
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text='{"city":"Paris"}}]',
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice["finish_reason"] == "tool_calls"
+        assert "content" not in choice["delta"]
+        tool_call = choice["delta"]["tool_calls"][0]
+        assert tool_call["function"] == {
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+
+    def test_non_streaming_named_choice_converts_json_to_tool_calls(self, tokenizer):
+        post = self._post_processor(
+            tokenizer,
+            tool_choice={
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+            stream_response=False,
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text='{"city":"Paris"}',
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice["finish_reason"] == "tool_calls"
+        assert "content" not in choice["delta"]
+        assert choice["delta"]["tool_calls"][0]["function"] == {
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+
+    def test_invalid_fallback_output_is_returned_as_content(self, tokenizer):
+        post = self._post_processor(
+            tokenizer, tool_choice="required", stream_response=True
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text='[{"name":"get_weather","parameters":',
+                token_ids=[],
+                finish_reason="length",
+                logprobs=None,
+            )
+        )
+
+        assert choice["finish_reason"] == "length"
+        assert choice["delta"] == {
+            "role": "assistant",
+            "content": '[{"name":"get_weather","parameters":',
+        }
+
+    def test_multiple_fallback_tool_calls_respect_parallel_setting(self, tokenizer):
+        post = self._post_processor(
+            tokenizer,
+            tool_choice="required",
+            stream_response=False,
+            parallel_tool_calls=False,
+        )
+        text = (
+            '[{"name":"get_weather","parameters":{"city":"Paris"}},'
+            '{"name":"get_weather","parameters":{"city":"London"}}]'
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text=text,
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice["finish_reason"] == "stop"
+        assert choice["delta"] == {"role": "assistant", "content": text}
 
 
 @pytest.fixture(scope="module")

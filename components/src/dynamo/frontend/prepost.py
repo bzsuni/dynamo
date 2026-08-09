@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +51,7 @@ class PreprocessResult:
     engine_prompt: dict[str, Any]
     prompt_token_ids: list[int]
     guided_decoding: dict[str, Any] | None = None
+    uses_dynamo_json_tool_call_fallback: bool = False
 
 
 _ASYNC_TOKENIZER_POOL: dict[int, Callable[..., Awaitable[Any]]] = {}
@@ -571,6 +573,13 @@ async def preprocess_chat_request(
         if assistant_guided_decoding is not None and not is_forced_tool_choice
         else tool_guided_decoding
     )
+    uses_dynamo_json_tool_call_fallback = (
+        tool_parser is None
+        and _is_forced_tool_choice(request_for_sampling.tool_choice)
+        and guided_decoding == tool_guided_decoding
+        and isinstance(guided_decoding, dict)
+        and "json" in guided_decoding
+    )
 
     _, engine_prompt = await renderer.render_messages_async(messages, chat_params)
 
@@ -591,6 +600,7 @@ async def preprocess_chat_request(
         engine_prompt=engine_prompt,
         prompt_token_ids=tokens,
         guided_decoding=guided_decoding,
+        uses_dynamo_json_tool_call_fallback=uses_dynamo_json_tool_call_fallback,
     )
 
 
@@ -606,12 +616,14 @@ class StreamingPostProcessor:
         reasoning_parser_class: type[ReasoningParser] | None,
         chat_template_kwargs: dict[str, Any],
         stream_response: bool = True,
+        uses_dynamo_json_tool_call_fallback: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.request_for_sampling = request_for_sampling
         self.sampling_params = sampling_params
         self.tool_parser = tool_parser
         self.stream_response = stream_response
+        self._uses_dynamo_json_tool_call_fallback = uses_dynamo_json_tool_call_fallback
         # See https://github.com/ai-dynamo/dynamo/issues/8636 —
         # when the chat template runs with enable_thinking=False,
         # the reasoning open/close tags live in the prompt and the generated
@@ -631,7 +643,9 @@ class StreamingPostProcessor:
             else None
         )
         self._fast_plain_text = (
-            self.tool_parser is None and self.reasoning_parser is None
+            self.tool_parser is None
+            and self.reasoning_parser is None
+            and not self._uses_dynamo_json_tool_call_fallback
         )
 
         self._control_markers = tuple(
@@ -652,6 +666,103 @@ class StreamingPostProcessor:
         # this correctly, so we accumulate text here and fall back to the
         # non-streaming extract_tool_calls() once the buffer is complete.
         self._tool_text_buffer: str | None = None
+        self._dynamo_json_fallback_chunks: list[str] = []
+
+    def _add_dynamo_json_fallback_tool_calls(self, text: str) -> None:
+        """Convert Dynamo's JSON fallback wire format into OpenAI tool calls."""
+        try:
+            tool_calls = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Dynamo JSON tool-call fallback was not valid JSON"
+            ) from exc
+
+        available_tool_names = {
+            tool.function.name for tool in self.request_for_sampling.tools or []
+        }
+        tool_choice = self.request_for_sampling.tool_choice
+        required_tool_name = None
+        if _is_named_tool_choice(tool_choice):
+            if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
+                required_tool_name = tool_choice.function.name
+            else:
+                required_tool_name = tool_choice["function"]["name"]
+            if not isinstance(tool_calls, dict):
+                raise TypeError(
+                    "Dynamo JSON tool-call fallback parameters must be an object"
+                )
+            tool_calls = [
+                {
+                    "name": required_tool_name,
+                    "parameters": tool_calls,
+                }
+            ]
+        elif not isinstance(tool_calls, list) or not tool_calls:
+            raise ValueError(
+                "Dynamo JSON tool-call fallback must contain a tool-call array"
+            )
+
+        if (
+            self.request_for_sampling.parallel_tool_calls is False
+            and len(tool_calls) > 1
+        ):
+            raise ValueError(
+                "Dynamo JSON tool-call fallback returned multiple tool calls "
+                "when parallel_tool_calls is false"
+            )
+
+        for index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                raise TypeError(
+                    "Dynamo JSON tool-call fallback entries must be objects"
+                )
+            name = tool_call.get("name")
+            parameters = tool_call.get("parameters")
+            if not isinstance(name, str) or name not in available_tool_names:
+                raise ValueError(
+                    "Dynamo JSON tool-call fallback named an unavailable tool"
+                )
+            if required_tool_name is not None and name != required_tool_name:
+                raise ValueError(
+                    "Dynamo JSON tool-call fallback did not use the required tool"
+                )
+            if not isinstance(parameters, dict):
+                raise TypeError(
+                    "Dynamo JSON tool-call fallback parameters must be an object"
+                )
+            self.in_progress_tool_calls[index] = DeltaToolCall(
+                index=index,
+                type="function",
+                id=make_tool_call_id(),
+                function=DeltaFunctionCall(
+                    name=name,
+                    arguments=json.dumps(parameters, separators=(",", ":")),
+                ),
+            )
+
+    def _process_dynamo_json_fallback_tool_calls(
+        self, output: Any
+    ) -> dict[str, Any] | None:
+        if output.text:
+            self._dynamo_json_fallback_chunks.append(output.text)
+        self.previous_token_ids.extend(output.token_ids or [])
+        if not output.finish_reason:
+            return None
+
+        text = "".join(self._dynamo_json_fallback_chunks)
+        self._dynamo_json_fallback_chunks.clear()
+        try:
+            self._add_dynamo_json_fallback_tool_calls(text)
+        except (TypeError, ValueError):
+            delta = {"role": "assistant", "content": text} if text else {}
+            return self._build_choice(output, delta)
+
+        delta = {
+            "role": "assistant",
+            "tool_calls": self._dump_in_progress_tool_calls(),
+        }
+        self.in_progress_tool_calls.clear()
+        return self._build_choice(output, delta)
 
     def _should_buffer_for_non_streaming_tool_parse(self) -> bool:
         return (
@@ -892,6 +1003,8 @@ class StreamingPostProcessor:
         return self._build_choice(output, delta)
 
     def process_output(self, output: Any) -> dict[str, Any] | None:
+        if self._uses_dynamo_json_tool_call_fallback:
+            return self._process_dynamo_json_fallback_tool_calls(output)
         if self._should_buffer_for_non_streaming_tool_parse():
             return self._process_non_streaming_tool_output(output)
 
