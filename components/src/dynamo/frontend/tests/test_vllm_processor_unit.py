@@ -102,11 +102,20 @@ class TestDynamoJsonToolCallFallback:
     """Dynamo's forced-choice JSON fallback must emit OpenAI tool calls."""
 
     def _post_processor(
-        self, tokenizer, *, tool_choice, stream_response, parallel_tool_calls=None
+        self,
+        tokenizer,
+        *,
+        tool_choice,
+        stream_response,
+        parallel_tool_calls=None,
+        tool_parameters=None,
     ):
-        request = {**TOOL_REQUEST, "tool_choice": tool_choice}
+        request = json.loads(json.dumps(TOOL_REQUEST))
+        request["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             request["parallel_tool_calls"] = parallel_tool_calls
+        if tool_parameters is not None:
+            request["tools"][0]["function"]["parameters"] = tool_parameters
         request, _, _, _, _ = _prepare_request(
             request,
             tokenizer=tokenizer,
@@ -232,6 +241,97 @@ class TestDynamoJsonToolCallFallback:
 
         assert choice["finish_reason"] == "stop"
         assert choice["delta"] == {"role": "assistant", "content": text}
+
+    def test_non_finite_fallback_arguments_are_returned_as_content(self, tokenizer):
+        post = self._post_processor(
+            tokenizer, tool_choice="required", stream_response=False
+        )
+        text = '[{"name":"get_weather","parameters":{"temperature":NaN}}]'
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text=text,
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice is not None
+        assert choice["finish_reason"] == "stop"
+        assert choice["delta"] == {"role": "assistant", "content": text}
+
+    def test_invalid_fallback_does_not_leave_partial_tool_state(self, tokenizer):
+        post = self._post_processor(
+            tokenizer, tool_choice="required", stream_response=False
+        )
+        text = (
+            '[{"name":"get_weather","parameters":{"city":"Paris"}},'
+            '{"name":"unknown","parameters":{}}]'
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text=text,
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice is not None
+        assert choice["finish_reason"] == "stop"
+        assert choice["delta"] == {"role": "assistant", "content": text}
+        assert post.in_progress_tool_calls == {}
+
+    def test_named_choice_accepts_array_arguments(self, tokenizer):
+        post = self._post_processor(
+            tokenizer,
+            tool_choice={
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+            stream_response=False,
+            tool_parameters={"type": "array", "items": {"type": "string"}},
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text='["Paris","Seoul"]',
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice is not None
+        assert choice["delta"]["tool_calls"][0]["function"]["arguments"] == (
+            '["Paris","Seoul"]'
+        )
+
+    def test_required_choice_accepts_null_arguments(self, tokenizer):
+        post = self._post_processor(
+            tokenizer,
+            tool_choice="required",
+            stream_response=False,
+            tool_parameters={"type": "null"},
+        )
+
+        choice = post.process_output(
+            SimpleNamespace(
+                index=0,
+                text='[{"name":"get_weather","parameters":null}]',
+                token_ids=[],
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert choice is not None
+        assert choice["delta"]["tool_calls"][0]["function"]["arguments"] == "null"
 
 
 @pytest.fixture(scope="module")

@@ -58,6 +58,10 @@ _ASYNC_TOKENIZER_POOL: dict[int, Callable[..., Awaitable[Any]]] = {}
 SKIP_REQUEST_VALIDATION = os.getenv("DYN_VLLM_SKIP_REQUEST_VALIDATION", "1") == "1"
 
 
+def _reject_non_finite_json(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
 def _is_named_tool_choice(tool_choice: Any) -> bool:
     """True only for a well-formed named tool choice.
 
@@ -671,8 +675,8 @@ class StreamingPostProcessor:
     def _add_dynamo_json_fallback_tool_calls(self, text: str) -> None:
         """Convert Dynamo's JSON fallback wire format into OpenAI tool calls."""
         try:
-            tool_calls = json.loads(text)
-        except json.JSONDecodeError as exc:
+            tool_calls = json.loads(text, parse_constant=_reject_non_finite_json)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(
                 "Dynamo JSON tool-call fallback was not valid JSON"
             ) from exc
@@ -687,10 +691,6 @@ class StreamingPostProcessor:
                 required_tool_name = tool_choice.function.name
             else:
                 required_tool_name = tool_choice["function"]["name"]
-            if not isinstance(tool_calls, dict):
-                raise TypeError(
-                    "Dynamo JSON tool-call fallback parameters must be an object"
-                )
             tool_calls = [
                 {
                     "name": required_tool_name,
@@ -711,13 +711,18 @@ class StreamingPostProcessor:
                 "when parallel_tool_calls is false"
             )
 
+        parsed_tool_calls: dict[int, DeltaToolCall] = {}
         for index, tool_call in enumerate(tool_calls):
             if not isinstance(tool_call, dict):
                 raise TypeError(
                     "Dynamo JSON tool-call fallback entries must be objects"
                 )
             name = tool_call.get("name")
-            parameters = tool_call.get("parameters")
+            if "parameters" not in tool_call:
+                raise TypeError(
+                    "Dynamo JSON tool-call fallback entries must include parameters"
+                )
+            parameters = tool_call["parameters"]
             if not isinstance(name, str) or name not in available_tool_names:
                 raise ValueError(
                     "Dynamo JSON tool-call fallback named an unavailable tool"
@@ -726,11 +731,7 @@ class StreamingPostProcessor:
                 raise ValueError(
                     "Dynamo JSON tool-call fallback did not use the required tool"
                 )
-            if not isinstance(parameters, dict):
-                raise TypeError(
-                    "Dynamo JSON tool-call fallback parameters must be an object"
-                )
-            self.in_progress_tool_calls[index] = DeltaToolCall(
+            parsed_tool_calls[index] = DeltaToolCall(
                 index=index,
                 type="function",
                 id=make_tool_call_id(),
@@ -739,6 +740,7 @@ class StreamingPostProcessor:
                     arguments=json.dumps(parameters, separators=(",", ":")),
                 ),
             )
+        self.in_progress_tool_calls.update(parsed_tool_calls)
 
     def _process_dynamo_json_fallback_tool_calls(
         self, output: Any
